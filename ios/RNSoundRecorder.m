@@ -1,17 +1,25 @@
 
 #import "RNSoundRecorder.h"
 #import <AVFoundation/AVFoundation.h>
+#import "RNSoundpPeakPower.h"
 
 @implementation RNSoundRecorder {
     AVAudioRecorder* _recorder;
-    RCTPromiseResolveBlock _resolveStop;
-    RCTPromiseRejectBlock _rejectStop;
+    NSTimer *_peakPowerTimer;
 }
 
 - (dispatch_queue_t)methodQueue
 {
     return dispatch_get_main_queue();
 }
+
+- (void)levelTimerCallback:(NSTimer *)timer{
+    [_recorder updateMeters];
+    CGFloat lowPassResults = pow(10, (0.05 * [_recorder peakPowerForChannel:0]));
+    lowPassResults = lowPassResults > 1 ? 1.0 : lowPassResults;
+    [RNSoundpPeakPower sendPeakPower:lowPassResults];
+}
+
 RCT_EXPORT_MODULE()
 
 - (NSDictionary *)constantsToExport
@@ -110,7 +118,7 @@ RCT_EXPORT_METHOD(start:(NSString *)path
     NSError* err = nil;
 
     AVAudioSession* session = [AVAudioSession sharedInstance];
-    [session setCategory:AVAudioSessionCategoryPlayAndRecord error:&err];
+    [session setCategory:AVAudioSessionCategoryRecord error:&err];
     
     if (err) {
         reject(@"init_session_error", [[err userInfo] description], err);
@@ -126,7 +134,7 @@ RCT_EXPORT_METHOD(start:(NSString *)path
         reject(@"init_recorder_error", [[err userInfo] description], err);
         return;
     }
-    
+    _recorder.meteringEnabled = YES;
     [_recorder prepareToRecord];
     [_recorder record];
     [session setActive:YES error:&err];
@@ -142,6 +150,8 @@ RCT_EXPORT_METHOD(start:(NSString *)path
         reject(@"recording_failed", [@"Cannot record audio at path: " stringByAppendingString:[_recorder url].absoluteString], nil);
     }
     
+    _peakPowerTimer = [NSTimer scheduledTimerWithTimeInterval:0.3 target:self selector: @selector(levelTimerCallback:) userInfo:nil repeats:YES];
+    
 }
 
 RCT_EXPORT_METHOD(stop:(RCTPromiseResolveBlock)resolve rejecter:(RCTPromiseRejectBlock)reject)
@@ -151,16 +161,9 @@ RCT_EXPORT_METHOD(stop:(RCTPromiseResolveBlock)resolve rejecter:(RCTPromiseRejec
         return;
     }
     
-    _resolveStop = resolve;
-    _rejectStop = reject;
-    [_recorder stop];
-
-}
-
-- (void)audioRecorderDidFinishRecording:(AVAudioRecorder *)recorder successfully:(BOOL)flag
-{
+    NSError* err = nil;
     
-    __block NSError* err = nil;
+    [_recorder stop];
     
     // prepare the response
     NSString* url = [_recorder url].absoluteString;
@@ -168,31 +171,25 @@ RCT_EXPORT_METHOD(stop:(RCTPromiseResolveBlock)resolve rejecter:(RCTPromiseRejec
     AVAudioPlayer* player = [[AVAudioPlayer alloc] initWithContentsOfURL:[_recorder url] error:nil];
     NSDictionary* response = @{@"duration": @(player.duration * 1000), @"path": url};
     
-    // deactivate the audio session
+    _recorder = nil; // release it
+    
     AVAudioSession* session = [AVAudioSession sharedInstance];
     [session setActive:NO error:&err];
     
-    if (err && [err code] != AVAudioSessionErrorCodeIsBusy) {
-        _rejectStop(@"session_set_active_error", [[err userInfo] description], err);
+    if (err) {
+        reject(@"session_set_active_error", [[err userInfo] description], err);
         return;
     }
-    
-    err = nil;
     
     [session setCategory:AVAudioSessionCategoryPlayback error:&err];
     
     if (err) {
-        _rejectStop(@"reset_session_error", [[err userInfo] description], err);
+        reject(@"reset_session_error", [[err userInfo] description], err);
         return;
     }
     
-    _resolveStop(response);
-    
-    // release the recorder promise resolver
-    _recorder = nil;
-    _resolveStop = nil;
-    _rejectStop = nil;
-    
+    resolve(response);
+
 }
 
 RCT_EXPORT_METHOD(pause:(RCTPromiseResolveBlock)resolve rejecter:(RCTPromiseRejectBlock)reject)
@@ -222,6 +219,21 @@ RCT_EXPORT_METHOD(resume:(RCTPromiseResolveBlock)resolve rejecter:(RCTPromiseRej
     [_recorder record];
     
     resolve([NSNull null]);
+}
+
+- (void)clearSource {
+    if (_peakPowerTimer != nil) {
+        [_peakPowerTimer invalidate];
+        _peakPowerTimer = nil;
+    }
+}
+
+- (void)audioRecorderDidFinishRecording:(AVAudioRecorder *)recorder successfully:(BOOL)flag {
+    [self clearSource];
+}
+
+-(void)audioRecorderEncodeErrorDidOccur:(AVAudioRecorder *)recorder error:(NSError *)error {
+    [self clearSource];
 }
 
 @end
